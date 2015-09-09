@@ -57,41 +57,56 @@ class LookupModule(LookupBase):
         salt_chars = ascii_letters + digits + './'
         return self.random_password(length=8, chars=salt_chars)
 
+    def _parse_parameters(self, term):
+        # Hacky parsing of params
+        # See #XXX and the first_found lookup For how we want to fix this later
+        first_split = term.split(' ', 1)
+        if len(first_split) <= 1:
+            # Only a single argument given, therefore it's a path
+            relpath = term
+            params = dict()
+        else:
+            relpath = first_split[0]
+            params = parse_kv(first_split[1])
+            if '_raw_params' in params:
+                # Spaces in the path?
+                relpath = ' '.join((relpath, params['_raw_params']))
+                del params['_raw_params']
+
+                # Check that we parsed the params correctly
+                if not term.startswith(relpath):
+                    # Likely, the user had a non parameter following a parameter.
+                    # Reject this as a user typo
+                    raise AnsibleError('Unrecognized value after key=value parameters given to password lookup')
+            # No _raw_params means we already found the complete path when
+            # we split it initially
+
+        invalid_params = frozenset(params.keys()).difference(VALID_PARAMS)
+        if invalid_params:
+            raise AnsibleError('Unrecognized parameter(s) given to password lookup: %s' % ', '.join(invalid_params))
+
+        length = int(params.get('length', DEFAULT_LENGTH))
+        encrypt = params.get('encrypt', None)
+
+        use_chars = params.get('chars', None)
+        if use_chars:
+            tmp_chars = []
+            if ',,' in use_chars:
+                tmp_chars.append(',')
+            tmp_chars.extend(use_chars.replace(',,', ',').split(','))
+            use_chars = tmp_chars
+        else:
+            # Default chars for password
+            use_chars = ['ascii_letters', 'digits', ".,:-_"]
+
+        return relpath, dict(length=length, encrypt=encrypt, use_chars=use_chars)
+
     def run(self, terms, variables, **kwargs):
 
         ret = []
 
         for term in terms:
-            params = parse_kv(term)
-            if '_raw_params' in params:
-                relpath = params['_raw_params']
-                del params['_raw_params']
-            else:
-                relpath = params
-
-            # Check that we parsed the params correctly
-            if not term.startswith(relpath):
-                # Likely, the user had a non parameter following a parameter.
-                # Reject this as a user typo
-                raise AnsibleError('Unrecognized value after key=value parameters given to password lookup')
-
-            invalid_params = frozenset(params.keys()).difference(VALID_PARAMS)
-            if invalid_params:
-                raise AnsibleError('Unrecognized parameter(s) given to password lookup: %s' % ', '.join(invalid_params))
-
-            length = int(params.get('length', DEFAULT_LENGTH))
-            encrypt = params.get('encrypt', None)
-
-            use_chars = params.get('chars', None)
-            if use_chars:
-                tmp_chars = []
-                if ',,' in use_chars:
-                    tmp_chars.append(',')
-                tmp_chars.extend(use_chars.replace(',,', ',').split(','))
-                use_chars = tmp_chars
-            else:
-                # Default chars for password
-                use_chars = ['ascii_letters', 'digits', ".,:-_"]
+            relpath, params = self._parse_parameters(term)
 
             # get password or create it if file doesn't exist
             path = self._loader.path_dwim(relpath)
@@ -102,10 +117,10 @@ class LookupModule(LookupBase):
                 except OSError as e:
                     raise AnsibleError("cannot create the path for the password lookup: %s (error was %s)" % (pathdir, str(e)))
 
-                chars = "".join(getattr(string, c, c) for c in use_chars).replace('"', '').replace("'", '')
-                password = ''.join(random.choice(chars) for _ in range(length))
+                chars = "".join(getattr(string, c, c) for c in params['use_chars']).replace('"', '').replace("'", '')
+                password = ''.join(random.choice(chars) for _ in range(params['length']))
 
-                if encrypt is not None:
+                if params['encrypt'] is not None:
                     salt = self.random_salt()
                     content = '%s salt=%s' % (password, salt)
                 else:
@@ -125,20 +140,20 @@ class LookupModule(LookupBase):
                     salt = None
 
                 # crypt requested, add salt if missing
-                if (encrypt is not None and not salt):
+                if (params['encrypt'] is not None and not salt):
                     salt = self.random_salt()
                     content = '%s salt=%s' % (password, salt)
                     with open(path, 'w') as f:
                         os.chmod(path, 0o600)
                         f.write(content + '\n')
                 # crypt not requested, remove salt if present
-                elif (encrypt is None and salt):
+                elif (params['encrypt'] is None and salt):
                     with open(path, 'w') as f:
                         os.chmod(path, 0o600)
                         f.write(password + '\n')
 
-            if encrypt:
-                password = do_encrypt(password, encrypt, salt=salt)
+            if params['encrypt']:
+                password = do_encrypt(password, params['encrypt'], salt=salt)
 
             ret.append(password)
 
